@@ -1,10 +1,20 @@
+from pathlib import Path
+import time
+import copy
 import h5py
 import pandas as pd
 import numpy as np
+from sklearn.decomposition import PCA, KernelPCA
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+from sklearn.gaussian_process import GaussianProcessRegressor
+
+import globals
 
 # ----------------------------
 # Utilities for loading data, preprocessing, and evaluation
 # ----------------------------
+
 
 def inspect_metadata(path):
     """
@@ -35,6 +45,7 @@ def inspect_metadata(path):
 
     return param_names, function_names
 
+
 def load_train_h5(path):
     """
     Load a training .h5 file
@@ -48,6 +59,7 @@ def load_train_h5(path):
 
     return X, Y, wvl
 
+
 def load_test_csv(path):
     """
     Load a test .csv file
@@ -57,6 +69,84 @@ def load_test_csv(path):
     df = pd.read_csv(path, header=None)
     X = df.to_numpy()
     return X.T
+
+
+def apply_pca(y_tr, y_val, n_components=10, kernel=None, gamma=1e-2, alpha=0.1, degree=3):
+    """
+    Apply PCA or KernelPCA to each function separately, retaining n_components components.
+    - y_tr: training outputs of shape (n_samples, n_functions, n_wavelengths)
+    - y_val: validation outputs of shape (n_samples, n_functions, n_wavelengths)
+    - n_components: number of PCA components to retain
+    - kernel: if None, use regular PCA, otherwise specify the kernel type for KernelPCA (e.g., 'rbf', 'poly', etc.)
+    - returns: list of PCA objects, list of transformed training outputs, list of transformed validation outputs
+    """
+
+    print(f"========== Applying {'KernelPCA' if kernel is not None else 'PCA'} with n_components={n_components} to each function separately... ==========")
+    pca_list = []
+    y_tr_pca_list = []
+    y_val_pca_list = []
+
+    for i in range(globals.N_FUNCTIONS):
+        if kernel is not None:
+            pca = KernelPCA(n_components=n_components, kernel=kernel, gamma=gamma, fit_inverse_transform=True, alpha=alpha, degree=degree)
+        else:
+            pca = PCA(n_components=n_components)
+        
+        y_tr_i = y_tr[:, i, :] # shape of function: (n_samples, n_wavelengths)
+        y_val_i = y_val[:, i, :]
+        
+        y_tr_pca = pca.fit_transform(y_tr_i)     # fit training here
+        y_val_pca = pca.transform(y_val_i)       # just transform validation to avoid information leak
+        
+        pca_list.append(pca)
+        y_tr_pca_list.append(y_tr_pca)
+        y_val_pca_list.append(y_val_pca)
+
+    # print amount of explained variance and number of components for each function
+    total_explained_variance = 0
+
+    if kernel is None:
+        print("  Regular PCA used, displaying results:")
+        for i, pca in enumerate(pca_list):
+            explained_variance = pca.explained_variance_ratio_.sum()
+            total_explained_variance += explained_variance
+            print(f"  Function {i+1}: Explained variance = {explained_variance:.4f}")
+            print(f"  Number of components retained: {pca.n_components_}")
+            print()
+
+        print(f"  Total explained variance = {total_explained_variance:.4f}")
+
+    print("========== PCA application completed. ==========\n")
+
+    return pca_list, y_tr_pca_list, y_val_pca_list
+
+
+def scale_data(x_tr, x_val, y_tr_red_list, scale_type="standard"):
+    """
+    Scale the data using either standard scaling or min-max scaling
+    - inputs: training inputs, validation inputs, list of PCA-transformed training outputs, scaling type
+    - outputs: scaled training inputs, scaled validation inputs, list of scaled PCA-transformed training outputs, list of scalers used for each output function
+    """
+    print(f"========== Scaling data using {scale_type} scaling... ==========")
+    scaler = StandardScaler() if scale_type == "standard" else MinMaxScaler()
+
+    # standard scaling
+    x_scaler = scaler.fit(x_tr)
+    x_tr_scaled = x_scaler.transform(x_tr)
+    x_val_scaled = x_scaler.transform(x_val)
+
+    y_scalers = []
+    y_tr_reduced_scaled_list = []
+    for i in range(globals.N_FUNCTIONS):
+        scaler = StandardScaler() if scale_type == "standard" else MinMaxScaler()
+        y_scaled = scaler.fit_transform(y_tr_red_list[i])
+        y_scalers.append(scaler)
+        y_tr_reduced_scaled_list.append(y_scaled)
+
+    print("========== Scaling completed. ==========\n")
+
+    return x_tr_scaled, x_val_scaled, y_tr_reduced_scaled_list, y_scalers
+
 
 def build_mask(wavelengths):
     """
@@ -74,18 +164,101 @@ def build_mask(wavelengths):
     )
     return mask
 
-def mre(y_true, y_pred, wavelengths, epsilon=1e-8):
+
+def mre_score(y_true, y_pred, wavelengths, axis=None, epsilon=1e-8):
     """
     Mean Relative Error (MRE) metric
     - inputs: y_true (true values), y_pred (predicted values), wavelengths (wavelength values), epsilon (small constant to avoid division by zero)
-    - output: average MRE value over all samples, functions and wavelengths
+    - output: MRE score, either as a global scalar or as an array depending on the axis parameter
+
+    axis options:
+        None -> global scalar
+        2    -> per function
+        1    -> per wavelength
+        0    -> per function and per wavelength
     """
-    eps = 1e-8 # lower values of epsilon lead to very high MRE due to division by small numbers, higher values get more stable MRE estimates
+    # standard value of epsilon is 1e-8, since lower values lead to very high MRE due to division by small numbers, while higher values get more stable MRE estimates
     
     mask = build_mask(wavelengths)
 
-    mre = np.mean(
-        np.abs(y_pred[:, :, mask] - y_true[:, :, mask]) /
-        (np.abs(y_true[:, :, mask]) + eps)
-    )
+    if axis is None:
+        mre = np.mean(
+            np.abs(y_pred[:, :, mask] - y_true[:, :, mask]) / (np.abs(y_true[:, :, mask]) + epsilon)
+        )
+    elif axis == 2:
+        mre = np.mean(
+            np.abs(y_pred[:, :, mask] - y_true[:, :, mask]) / (np.abs(y_true[:, :, mask]) + epsilon),
+            axis=(0, 2)
+        )
+    elif axis == 1:
+        mre = np.mean(
+            np.abs(y_pred - y_true) / (np.abs(y_true) + epsilon),
+            axis=(0, 1)
+        )
+    elif axis == 0:
+        mre = np.mean(
+            np.abs(y_pred - y_true) / (np.abs(y_true) + epsilon),
+            axis=0
+        )
+    else:
+        raise ValueError("Invalid axis value. Must be None, 0, 1, or 2.")
+    
     return mre
+
+
+def mae_score(y_true, y_pred, wavelengths, axis=None):
+    """
+    Mean Absolute Error (MAE) metric
+    - inputs: y_true (true values), y_pred (predicted values), wavelengths (wavelength values)
+    - output: MAE score, either as a global scalar or as an array depending on the axis parameter
+
+    axis options:
+        None -> global scalar
+        2    -> per function
+        1    -> per wavelength
+        0    -> per function and per wavelength
+    """
+
+    mask = build_mask(wavelengths)
+
+    if axis is None:
+        mae = np.mean(
+            np.abs(y_pred[:, :, mask] - y_true[:, :, mask])
+        )
+    elif axis == 2:
+        mae = np.mean(
+            np.abs(y_pred[:, :, mask] - y_true[:, :, mask]),
+            axis=(0, 2)
+        )
+    elif axis == 1:
+        mae = np.mean(
+            np.abs(y_pred - y_true),
+            axis=(0, 1)
+        )
+    elif axis == 0:
+        mae = np.mean(
+            np.abs(y_pred - y_true),
+            axis=0
+        )
+    else:
+        raise ValueError("Invalid axis value. Must be None, 0, 1, or 2.")
+    
+    return mae
+
+
+def load_csv_last_id(path):
+    """
+    Load a CSV file and return the last id used for logging results
+    - inputs: path to the CSV file
+    - outputs: last id used in the CSV file, or 1 if the file does not exist or is empty
+    """
+
+    if Path(path).exists():
+        results_df = pd.read_csv(path)
+        last_id = results_df["id"].max()
+        if last_id is np.nan:
+            last_id = 0
+    else:
+        last_id = 0
+
+    return last_id
