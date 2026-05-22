@@ -20,5 +20,5 @@ TEST_FILE_B_EXTRAP = ROOT / "scenarioB" / "reference" / "refExtrap.csv"
 CURRENT_TRAIN_FILE = TRAIN_FILE_A_500
 CURRENT_TEST_FILE = TEST_FILE_A_INTERP
 
-# number of functions
 N_FUNCTIONS = 6
+N_INPUTS = 9

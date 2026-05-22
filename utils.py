@@ -71,6 +71,24 @@ def load_test_csv(path):
     return X.T
 
 
+def load_csv_last_id(path):
+    """
+    Load a CSV file and return the last id used for logging results
+    - inputs: path to the CSV file
+    - outputs: last id used in the CSV file, or 1 if the file does not exist or is empty
+    """
+
+    if Path(path).exists():
+        results_df = pd.read_csv(path)
+        last_id = results_df["id"].max()
+        if pd.isna(last_id):
+            last_id = 0
+    else:
+        last_id = 0
+
+    return last_id
+
+
 def apply_pca(y_tr, n_components=10, kernel=None, gamma=1e-2, alpha=0.1, degree=3):
     """
     Apply PCA or KernelPCA to each function separately, retaining n_components components.
@@ -116,19 +134,31 @@ def apply_pca(y_tr, n_components=10, kernel=None, gamma=1e-2, alpha=0.1, degree=
     return pca_list, y_tr_pca_list
 
 
-def scale_data(x_tr, x_val, y_tr_red_list, scale_type="standard"):
+def scale_input_data(x_tr, x_val, scale_type="standard"):
     """
     Scale the data using either standard scaling or min-max scaling
     - inputs: training inputs, validation inputs, list of PCA-transformed training outputs, scaling type
     - outputs: scaled training inputs, scaled validation inputs, list of scaled PCA-transformed training outputs, list of scalers used for each output function
     """
-    print(f"---------- Scaling data using {scale_type} scaling... ----------")
-    scaler = StandardScaler() if scale_type == "standard" else MinMaxScaler()
+    print(f"---------- Scaling input data using {scale_type} scaling... ----------")
 
-    # standard scaling
+    scaler = StandardScaler() if scale_type == "standard" else MinMaxScaler()
     x_scaler = scaler.fit(x_tr)
     x_tr_scaled = x_scaler.transform(x_tr)
     x_val_scaled = x_scaler.transform(x_val)
+
+    print("---------- Input data scaling completed. ----------\n")
+
+    return x_tr_scaled, x_val_scaled, scaler
+
+
+def scale_output_data(y_tr_red_list, scale_type="standard"):
+    """
+    Scale the output data using the provided scalers
+    - inputs: list of PCA-transformed training outputs, list of PCA-transformed validation outputs, list of scalers used for each output function
+    - outputs: list of scaled PCA-transformed training outputs, list of scaled PCA-transformed validation outputs
+    """
+    print(f"---------- Scaling output data using {scale_type} scaling... ----------")
 
     y_scalers = []
     y_tr_reduced_scaled_list = []
@@ -138,9 +168,9 @@ def scale_data(x_tr, x_val, y_tr_red_list, scale_type="standard"):
         y_scalers.append(scaler)
         y_tr_reduced_scaled_list.append(y_scaled)
 
-    print("---------- Scaling completed. ----------\n")
+    print("---------- Output data scaling completed. ----------\n")
 
-    return x_tr_scaled, x_val_scaled, y_tr_reduced_scaled_list, y_scalers
+    return y_tr_reduced_scaled_list, y_scalers
 
 
 def build_mask(wavelengths):
@@ -241,19 +271,24 @@ def mae_score(y_true, y_pred, wavelengths, axis=None):
     return mae
 
 
-def load_csv_last_id(path):
+def calculate_coverage(y_true, y_pred, y_std, sigma=2):
     """
-    Load a CSV file and return the last id used for logging results
-    - inputs: path to the CSV file
-    - outputs: last id used in the CSV file, or 1 if the file does not exist or is empty
+    Calculates the percentage of true values falling within the GP uncertainty bands.
+    - inputs: y_true (true values), y_pred (predicted mean), y_std (predicted standard deviation), sigma (number of standard deviations for the confidence interval)
+    - outputs: global coverage percentage, coverage percentage per function
     """
+    # define bounds: (n_samples, n_functions, n_wavelengths)
+    lower_bound = y_pred - sigma * y_std
+    upper_bound = y_pred + sigma * y_std
 
-    if Path(path).exists():
-        results_df = pd.read_csv(path)
-        last_id = results_df["id"].max()
-        if pd.isna(last_id):
-            last_id = 0
-    else:
-        last_id = 0
+    # boolean mask: True if the value is within the interval
+    is_inside = (y_true >= lower_bound) & (y_true <= upper_bound)
 
-    return last_id
+    # global coverage
+    global_coverage = np.mean(is_inside) * 100
+
+    # coverage per function
+    # average across axis 0 (samples) and 2 (wavelengths)
+    per_function_coverage = np.mean(is_inside, axis=(0, 2)) * 100
+
+    return global_coverage, per_function_coverage
